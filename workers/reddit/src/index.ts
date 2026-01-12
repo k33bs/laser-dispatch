@@ -238,11 +238,9 @@ export default {
 
     if (url.pathname === '/trigger') {
       ctx.waitUntil(this.scheduled({} as ScheduledController, env, ctx));
-      return new Response('Triggered!', { status: 200 });
+      return new Response('OK', { status: 200 });
     }
 
-    return new Response('Reddit to Discord Worker\n\nGET /trigger - manually trigger the cron job', {
-      status: 200,
-    });
+    return new Response('Not found', { status: 404 });
   },
 };
