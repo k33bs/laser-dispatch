@@ -5,8 +5,9 @@ interface Env {
 }
 
 const REPOS = [
-  'anthropics/claude-code',
-  'openai/codex',
+  'k33bs/laser-dispatch',
+  'k33bs/HellPad',
+  'k33bs/vibedeck'
   // Add more repos here
 ];
 
