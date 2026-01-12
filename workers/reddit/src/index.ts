@@ -129,12 +129,21 @@ function createDiscordEmbed(post: RedditPost) {
     embed.image = { url: image };
   }
 
-  if (post.selftext && !post.is_self) {
-    embed.description = post.selftext.slice(0, 300) + (post.selftext.length > 300 ? '...' : '');
+  let description = '';
+
+  // Add selftext for text posts
+  if (post.selftext) {
+    description = post.selftext.slice(0, 500) + (post.selftext.length > 500 ? '...' : '');
   }
 
+  // Add external link if it's a link post
   if (!post.is_self && post.url !== redditUrl) {
-    embed.description = `🔗 [External Link](${post.url})`;
+    const linkText = `🔗 [External Link](${post.url})`;
+    description = description ? `${description}\n\n${linkText}` : linkText;
+  }
+
+  if (description) {
+    embed.description = description;
   }
 
   return embed;
