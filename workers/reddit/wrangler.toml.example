@@ -1,0 +1,17 @@
+name = "reddit-to-discord"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# Cron trigger - runs every hour
+[triggers]
+crons = ["0 * * * *"]
+
+# KV namespace for tracking posted content
+[[kv_namespaces]]
+binding = "POSTED_CACHE"
+id = "YOUR_KV_NAMESPACE_ID"
+
+# Secrets (set via `wrangler secret put <NAME>`):
+# - DISCORD_WEBHOOK_URL: Your Discord webhook URL
+#
+# Subreddits are configured in src/index.ts
