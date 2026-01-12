@@ -140,25 +140,38 @@ function createDiscordEmbed(post: RedditPost) {
   return embed;
 }
 
-async function postToDiscord(webhookUrl: string, post: RedditPost): Promise<boolean> {
+async function postToDiscord(webhookUrl: string, post: RedditPost, retries = 3): Promise<boolean> {
   const embed = createDiscordEmbed(post);
 
-  const response = await fetch(webhookUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      embeds: [embed],
-    }),
-  });
+  for (let attempt = 0; attempt < retries; attempt++) {
+    const response = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        embeds: [embed],
+      }),
+    });
 
-  if (!response.ok) {
+    if (response.ok) {
+      return true;
+    }
+
+    if (response.status === 429) {
+      const retryAfter = response.headers.get('Retry-After');
+      const waitMs = retryAfter ? parseInt(retryAfter) * 1000 : (attempt + 1) * 2000;
+      console.log(`Rate limited, waiting ${waitMs}ms before retry...`);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      continue;
+    }
+
     console.error(`Failed to post to Discord: ${response.status}`);
     return false;
   }
 
-  return true;
+  console.error('Failed to post to Discord after retries');
+  return false;
 }
 
 async function processSubreddit(
@@ -186,8 +199,8 @@ async function processSubreddit(
       });
       posted++;
 
-      // Rate limit: wait 1 second between posts to avoid Discord rate limits
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      // Rate limit: wait 2 seconds between posts to avoid Discord rate limits
+      await new Promise((resolve) => setTimeout(resolve, 2000));
     }
   }
 
