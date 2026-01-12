@@ -27,7 +27,7 @@ cp wrangler.toml.example wrangler.toml
 ### 3. Create KV namespace
 
 ```bash
-wrangler kv:namespace create POSTED_CACHE
+npx wrangler kv namespace create EAT_LASERS_REDDIT_POSTED_CACHE
 ```
 
 Copy the `id` from the output and update your `wrangler.toml`.
@@ -44,10 +44,10 @@ const SUBREDDITS = [
 ];
 ```
 
-### 5. Set secrets
+### 5. Set secrets (for production)
 
 ```bash
-wrangler secret put DISCORD_WEBHOOK_URL
+npx wrangler secret put EAT_LASERS_REDDIT_DISCORD_WEBHOOK_URL
 ```
 
 ### 6. Deploy
@@ -57,6 +57,16 @@ npm run deploy
 ```
 
 ## Development
+
+### Local secrets
+
+Create a `.dev.vars` file for local testing (gitignored):
+
+```
+EAT_LASERS_REDDIT_DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/your_webhook_here
+```
+
+### Run locally
 
 ```bash
 npm run dev
