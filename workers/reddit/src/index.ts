@@ -1,6 +1,6 @@
 interface Env {
-  POSTED_CACHE: KVNamespace;
-  DISCORD_WEBHOOK_URL: string;
+  EAT_LASERS_REDDIT_POSTED_CACHE: KVNamespace;
+  EAT_LASERS_REDDIT_DISCORD_WEBHOOK_URL: string;
 }
 
 const SUBREDDITS = [
@@ -171,17 +171,17 @@ async function processSubreddit(
 
   for (const post of posts) {
     const cacheKey = `reddit:${post.id}`;
-    const cached = await env.POSTED_CACHE.get(cacheKey);
+    const cached = await env.EAT_LASERS_REDDIT_POSTED_CACHE.get(cacheKey);
 
     if (cached) {
       skipped++;
       continue;
     }
 
-    const success = await postToDiscord(env.DISCORD_WEBHOOK_URL, post);
+    const success = await postToDiscord(env.EAT_LASERS_REDDIT_DISCORD_WEBHOOK_URL, post);
 
     if (success) {
-      await env.POSTED_CACHE.put(cacheKey, '1', {
+      await env.EAT_LASERS_REDDIT_POSTED_CACHE.put(cacheKey, '1', {
         expirationTtl: ONE_MONTH_SECONDS,
       });
       posted++;
