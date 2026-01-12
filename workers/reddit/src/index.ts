@@ -4,10 +4,27 @@ interface Env {
 }
 
 const SUBREDDITS = [
-  'programming',
-  'webdev',
-  'javascript',
-  'typescript',
+  "vibecoding",
+  "vibecodedevs",
+  "theVibeCoding",
+  "cursor",
+  "ClaudeAI",
+  "ClaudeCode",
+  "ChatGPTCoding",
+  "Codex",
+  "Anthropic",
+  "OpenAI",
+  "DeepSeek",
+  "LLMDevs",
+  "AI_Agents",
+  "AIPromptProgramming",
+  "windsurf",
+  "Codeium",
+  "replit",
+  "githubcopilot",
+  "PromptEngineering",
+  "indiehackers",
+  "nocode"
 ];
 
 interface RedditPost {
