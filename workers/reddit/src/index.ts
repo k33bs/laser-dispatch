@@ -57,23 +57,58 @@ interface RedditResponse {
 }
 
 const ONE_MONTH_SECONDS = 30 * 24 * 60 * 60;
+const MAX_POSTS_PER_RUN = 10; // Limit posts per 1-min run
+const DELAY_BETWEEN_POSTS_MS = 500; // Reduced delay, rely on 429 retry logic
+const POISON_PILL_TTL_SECONDS = 24 * 60 * 60; // 24 hours for failed posts
+const SUBREDDIT_FETCH_INTERVAL_MS = 10 * 60 * 1000; // Fetch each subreddit every 10 minutes
+const MAX_SUBREDDITS_PER_RUN = 8; // Max subreddits to fetch per 1-min cron run (~8 req/min)
+
+// Reddit API compliant User-Agent: <platform>:<app ID>:<version> (by /u/<username>)
+const REDDIT_USER_AGENT = 'cloudflare:laser-dispatch:1.0 (by /u/k33bs)';
+
+// Decode HTML entities from Reddit API responses
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&mdash;/g, '—')
+    .replace(/&ndash;/g, '–')
+    .replace(/&copy;/g, '©')
+    .replace(/&hellip;/g, '…')
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, code) => String.fromCharCode(parseInt(code, 16)));
+}
 
 async function fetchSubredditTop(subreddit: string): Promise<RedditPost[]> {
   const url = `https://www.reddit.com/r/${subreddit}/top.json?t=week&limit=10`;
 
-  const response = await fetch(url, {
-    headers: {
-      'User-Agent': 'laser-dispatch-bot/1.0',
-    },
-  });
+  try {
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': REDDIT_USER_AGENT,
+      },
+    });
 
-  if (!response.ok) {
-    console.error(`Failed to fetch r/${subreddit}: ${response.status}`);
+    if (response.status === 429) {
+      console.warn(`Rate limited by Reddit on r/${subreddit}`);
+      return [];
+    }
+
+    if (!response.ok) {
+      console.error(`Failed to fetch r/${subreddit}: ${response.status}`);
+      return [];
+    }
+
+    const data = (await response.json()) as RedditResponse;
+    return data.data?.children?.map((child) => child.data) || [];
+  } catch (err) {
+    console.error(`Error fetching/parsing r/${subreddit}:`, err);
     return [];
   }
-
-  const data = (await response.json()) as RedditResponse;
-  return data.data.children.map((child) => child.data);
 }
 
 function getPostImage(post: RedditPost): string | null {
@@ -91,9 +126,10 @@ function getPostImage(post: RedditPost): string | null {
 function createDiscordEmbed(post: RedditPost) {
   const redditUrl = `https://reddit.com${post.permalink}`;
   const image = getPostImage(post);
+  const title = decodeHtmlEntities(post.title);
 
   const embed: Record<string, unknown> = {
-    title: post.title.slice(0, 256),
+    title: title.slice(0, 256),
     url: redditUrl,
     color: 0xff4500,
     author: {
@@ -133,7 +169,8 @@ function createDiscordEmbed(post: RedditPost) {
 
   // Add selftext for text posts
   if (post.selftext) {
-    description = post.selftext.slice(0, 500) + (post.selftext.length > 500 ? '...' : '');
+    const selftext = decodeHtmlEntities(post.selftext);
+    description = selftext.slice(0, 500) + (selftext.length > 500 ? '...' : '');
   }
 
   // Add external link if it's a link post
@@ -149,7 +186,12 @@ function createDiscordEmbed(post: RedditPost) {
   return embed;
 }
 
-async function postToDiscord(webhookUrl: string, post: RedditPost, retries = 3): Promise<boolean> {
+interface PostResult {
+  success: boolean;
+  fatal: boolean; // true = permanent failure (4xx), false = transient (5xx/network)
+}
+
+async function postToDiscord(webhookUrl: string, post: RedditPost, retries = 3): Promise<PostResult> {
   const embed = createDiscordEmbed(post);
 
   for (let attempt = 0; attempt < retries; attempt++) {
@@ -164,56 +206,124 @@ async function postToDiscord(webhookUrl: string, post: RedditPost, retries = 3):
     });
 
     if (response.ok) {
-      return true;
+      return { success: true, fatal: false };
     }
 
+    // Handle rate limiting with retry
     if (response.status === 429) {
       const retryAfter = response.headers.get('Retry-After');
-      const waitMs = retryAfter ? parseInt(retryAfter) * 1000 : (attempt + 1) * 2000;
+      const parsedRetry = retryAfter ? parseInt(retryAfter) : NaN;
+      const waitMs = !isNaN(parsedRetry) ? parsedRetry * 1000 : (attempt + 1) * 1000;
       console.log(`Rate limited, waiting ${waitMs}ms before retry...`);
       await new Promise((resolve) => setTimeout(resolve, waitMs));
       continue;
     }
 
-    console.error(`Failed to post to Discord: ${response.status}`);
-    return false;
-  }
+    // 4xx client errors (except 429) are fatal - won't succeed on retry
+    if (response.status >= 400 && response.status < 500) {
+      console.error(`Discord rejected post (${response.status}): ${post.title.slice(0, 50)}`);
+      return { success: false, fatal: true };
+    }
 
-  console.error('Failed to post to Discord after retries');
-  return false;
-}
-
-async function processSubreddit(
-  subreddit: string,
-  env: Env
-): Promise<{ posted: number; skipped: number }> {
-  const posts = await fetchSubredditTop(subreddit);
-  let posted = 0;
-  let skipped = 0;
-
-  for (const post of posts) {
-    const cacheKey = `reddit:${post.id}`;
-    const cached = await env.EAT_LASERS_REDDIT_POSTED_CACHE.get(cacheKey);
-
-    if (cached) {
-      skipped++;
+    // Retry 5xx server errors
+    if (response.status >= 500) {
+      console.warn(`Discord server error (${response.status}), attempt ${attempt + 1}/${retries}`);
+      await new Promise((resolve) => setTimeout(resolve, (attempt + 1) * 1000));
       continue;
     }
 
-    const success = await postToDiscord(env.EAT_LASERS_REDDIT_DISCORD_WEBHOOK_URL, post);
+    console.error(`Failed to post to Discord: ${response.status}`);
+    return { success: false, fatal: false };
+  }
 
-    if (success) {
-      await env.EAT_LASERS_REDDIT_POSTED_CACHE.put(cacheKey, '1', {
-        expirationTtl: ONE_MONTH_SECONDS,
-      });
-      posted++;
+  console.error('Failed to post to Discord after retries');
+  return { success: false, fatal: false }; // Transient - retry next run
+}
 
-      // Rate limit: wait 2 seconds between posts to avoid Discord rate limits
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+interface PostCandidate {
+  post: RedditPost;
+  cacheKey: string;
+}
+
+async function getSubredditsDueForFetch(env: Env): Promise<string[]> {
+  const now = Date.now();
+
+  // Check last fetch time for all subreddits in parallel
+  const checks = await Promise.all(
+    SUBREDDITS.map(async (subreddit) => {
+      const lastFetchKey = `lastfetch:${subreddit}`;
+      const lastFetch = await env.EAT_LASERS_REDDIT_POSTED_CACHE.get(lastFetchKey);
+      const isDue = !lastFetch || (now - parseInt(lastFetch)) >= SUBREDDIT_FETCH_INTERVAL_MS;
+      return isDue ? subreddit : null;
+    })
+  );
+
+  return checks.filter((s): s is string => s !== null);
+}
+
+async function markSubredditFetched(env: Env, subreddit: string): Promise<void> {
+  const lastFetchKey = `lastfetch:${subreddit}`;
+  await env.EAT_LASERS_REDDIT_POSTED_CACHE.put(lastFetchKey, Date.now().toString(), {
+    expirationTtl: ONE_MONTH_SECONDS,
+  });
+}
+
+async function collectNewPosts(env: Env): Promise<PostCandidate[]> {
+  // Get subreddits that haven't been fetched in the last 10 minutes
+  const dueSubreddits = await getSubredditsDueForFetch(env);
+
+  if (dueSubreddits.length === 0) {
+    console.log('No subreddits due for fetch');
+    return [];
+  }
+
+  // Only fetch up to MAX_SUBREDDITS_PER_RUN to stay under rate limit
+  const toFetch = dueSubreddits.slice(0, MAX_SUBREDDITS_PER_RUN);
+  console.log(`Fetching ${toFetch.length}/${dueSubreddits.length} due subreddits: ${toFetch.join(', ')}`);
+
+  const allPosts: RedditPost[] = [];
+
+  // Fetch sequentially to be extra safe with rate limits
+  for (const subreddit of toFetch) {
+    const posts = await fetchSubredditTop(subreddit);
+    if (posts.length > 0) {
+      allPosts.push(...posts);
+    }
+    await markSubredditFetched(env, subreddit);
+
+    // Small delay between requests
+    if (toFetch.indexOf(subreddit) < toFetch.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
     }
   }
 
-  return { posted, skipped };
+  console.log(`Fetched ${allPosts.length} posts from ${toFetch.length} subreddits`);
+
+  // Check cache in parallel batches to find new posts
+  const candidates: PostCandidate[] = [];
+  const batchSize = 50;
+
+  for (let i = 0; i < allPosts.length; i += batchSize) {
+    const batch = allPosts.slice(i, i + batchSize);
+    const cacheChecks = await Promise.all(
+      batch.map(async (post) => {
+        const cacheKey = `reddit:${post.id}`;
+        const cached = await env.EAT_LASERS_REDDIT_POSTED_CACHE.get(cacheKey);
+        return { post, cacheKey, cached: !!cached };
+      })
+    );
+
+    for (const check of cacheChecks) {
+      if (!check.cached) {
+        candidates.push({ post: check.post, cacheKey: check.cacheKey });
+      }
+    }
+  }
+
+  // Sort by score descending so we post the best content first
+  candidates.sort((a, b) => b.post.score - a.post.score);
+
+  return candidates;
 }
 
 export default {
@@ -224,17 +334,43 @@ export default {
   ): Promise<void> {
     console.log(`Processing ${SUBREDDITS.length} subreddits...`);
 
-    let totalPosted = 0;
-    let totalSkipped = 0;
+    const candidates = await collectNewPosts(env);
+    console.log(`Found ${candidates.length} new posts to process`);
 
-    for (const subreddit of SUBREDDITS) {
-      const { posted, skipped } = await processSubreddit(subreddit, env);
-      totalPosted += posted;
-      totalSkipped += skipped;
-      console.log(`r/${subreddit}: posted ${posted}, skipped ${skipped}`);
+    let posted = 0;
+    let failed = 0;
+    const postsToProcess = candidates.slice(0, MAX_POSTS_PER_RUN);
+
+    for (const { post, cacheKey } of postsToProcess) {
+      const result = await postToDiscord(env.EAT_LASERS_REDDIT_DISCORD_WEBHOOK_URL, post);
+
+      if (result.success) {
+        await env.EAT_LASERS_REDDIT_POSTED_CACHE.put(cacheKey, '1', {
+          expirationTtl: ONE_MONTH_SECONDS,
+        });
+        posted++;
+        console.log(`Posted: [r/${post.subreddit}] ${post.title.slice(0, 50)}...`);
+      } else if (result.fatal) {
+        // Only cache 4xx errors as poison pills - these won't succeed on retry
+        await env.EAT_LASERS_REDDIT_POSTED_CACHE.put(cacheKey, 'failed', {
+          expirationTtl: POISON_PILL_TTL_SECONDS,
+        });
+        failed++;
+        console.warn(`Failed (poison pill 24h): [r/${post.subreddit}] ${post.title.slice(0, 50)}...`);
+      } else {
+        // Transient error (5xx/network) - don't cache, will retry next run
+        failed++;
+        console.warn(`Failed (will retry): [r/${post.subreddit}] ${post.title.slice(0, 50)}...`);
+      }
+
+      // Short delay between posts
+      if (posted + failed < postsToProcess.length) {
+        await new Promise((resolve) => setTimeout(resolve, DELAY_BETWEEN_POSTS_MS));
+      }
     }
 
-    console.log(`Done! Total posted: ${totalPosted}, skipped: ${totalSkipped}`);
+    const skipped = candidates.length - postsToProcess.length;
+    console.log(`Done! Posted: ${posted}, failed: ${failed}, skipped (over limit): ${skipped}`);
   },
 
   // HTTP handler for manual testing
