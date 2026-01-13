@@ -64,7 +64,7 @@ const SUBREDDIT_FETCH_INTERVAL_MS = 10 * 60 * 1000; // Fetch each subreddit ever
 const MAX_SUBREDDITS_PER_RUN = 8; // Max subreddits to fetch per 1-min cron run (~8 req/min)
 
 // Reddit API compliant User-Agent: <platform>:<app ID>:<version> (by /u/<username>)
-const REDDIT_USER_AGENT = 'cloudflare:laser-dispatch:1.0 (by /u/k33bs)';
+const REDDIT_USER_AGENT = 'cloudflare:laser-dispatch:1.0 (by /u/_k33bs_)';
 
 // Decode HTML entities from Reddit API responses
 function decodeHtmlEntities(text: string): string {

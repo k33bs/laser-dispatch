@@ -5,10 +5,13 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "tail": "wrangler tail"
+    "tail": "wrangler tail",
+    "seed": "npx tsx src/seed-kv.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240117.0",
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
     "typescript": "^5.3.3",
     "wrangler": "^3.24.0"
   }

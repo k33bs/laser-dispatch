@@ -29,6 +29,13 @@ interface GitHubCommit {
 }
 
 const ONE_MONTH_SECONDS = 30 * 24 * 60 * 60;
+const POISON_PILL_TTL_SECONDS = 24 * 60 * 60; // 24 hours for failed posts
+const DELAY_BETWEEN_POSTS_MS = 500; // Reduced delay, rely on 429 retry logic
+
+interface PostResult {
+  success: boolean;
+  fatal: boolean; // true = permanent failure (4xx), false = transient (5xx/network)
+}
 
 async function fetchRepoCommits(repo: string, token?: string): Promise<GitHubCommit[]> {
   const url = `https://api.github.com/repos/${repo}/commits?per_page=10`;
@@ -98,72 +105,124 @@ function createDiscordEmbed(commit: GitHubCommit, repo: string) {
   return embed;
 }
 
-async function postToDiscord(webhookUrl: string, commit: GitHubCommit, repo: string, retries = 3): Promise<boolean> {
+async function postToDiscord(webhookUrl: string, commit: GitHubCommit, repo: string, retries = 3): Promise<PostResult> {
   const embed = createDiscordEmbed(commit, repo);
 
   for (let attempt = 0; attempt < retries; attempt++) {
-    const response = await fetch(webhookUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        embeds: [embed],
-      }),
-    });
+    try {
+      const response = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          embeds: [embed],
+        }),
+      });
 
-    if (response.ok) {
-      return true;
+      if (response.ok) {
+        return { success: true, fatal: false };
+      }
+
+      // Handle rate limiting with retry
+      if (response.status === 429) {
+        const retryAfter = response.headers.get('Retry-After');
+        const parsedRetry = retryAfter ? parseInt(retryAfter) : NaN;
+        const waitMs = !isNaN(parsedRetry) ? parsedRetry * 1000 : (attempt + 1) * 1000;
+        console.log(`Rate limited, waiting ${waitMs}ms before retry...`);
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        continue;
+      }
+
+      // 4xx client errors (except 429) are fatal - won't succeed on retry
+      if (response.status >= 400 && response.status < 500) {
+        console.error(`Discord rejected commit (${response.status}): ${commit.sha.slice(0, 7)}`);
+        return { success: false, fatal: true };
+      }
+
+      // Retry 5xx server errors
+      if (response.status >= 500) {
+        console.warn(`Discord server error (${response.status}), attempt ${attempt + 1}/${retries}`);
+        await new Promise((resolve) => setTimeout(resolve, (attempt + 1) * 1000));
+        continue;
+      }
+
+      console.error(`Failed to post to Discord: ${response.status}`);
+      return { success: false, fatal: false };
+    } catch (err) {
+      // Network errors (DNS, timeout, etc.) - retry
+      console.warn(`Network error posting to Discord (attempt ${attempt + 1}/${retries}):`, err);
+      await new Promise((resolve) => setTimeout(resolve, (attempt + 1) * 1000));
     }
-
-    if (response.status === 429) {
-      const retryAfter = response.headers.get('Retry-After');
-      const waitMs = retryAfter ? parseInt(retryAfter) * 1000 : (attempt + 1) * 2000;
-      console.log(`Rate limited, waiting ${waitMs}ms before retry...`);
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
-      continue;
-    }
-
-    console.error(`Failed to post to Discord: ${response.status}`);
-    return false;
   }
 
   console.error('Failed to post to Discord after retries');
-  return false;
+  return { success: false, fatal: false }; // Transient - retry next run
+}
+
+interface CommitCandidate {
+  commit: GitHubCommit;
+  cacheKey: string;
 }
 
 async function processRepo(
   repo: string,
   env: Env
-): Promise<{ posted: number; skipped: number }> {
+): Promise<{ posted: number; skipped: number; failed: number }> {
   const commits = await fetchRepoCommits(repo, env.EAT_LASERS_GITHUB_TOKEN);
+
+  if (commits.length === 0) {
+    return { posted: 0, skipped: 0, failed: 0 };
+  }
+
+  // Check cache in parallel for all commits
+  const cacheChecks = await Promise.all(
+    commits.map(async (commit) => {
+      const cacheKey = `github:${commit.sha}`;
+      const cached = await env.EAT_LASERS_GITHUB_POSTED_CACHE.get(cacheKey);
+      return { commit, cacheKey, cached: !!cached };
+    })
+  );
+
+  // Filter to only new commits, reverse to post oldest first
+  const candidates: CommitCandidate[] = cacheChecks
+    .filter((c) => !c.cached)
+    .map(({ commit, cacheKey }) => ({ commit, cacheKey }))
+    .reverse();
+
   let posted = 0;
-  let skipped = 0;
+  let skipped = cacheChecks.filter((c) => c.cached).length;
+  let failed = 0;
 
-  // Process in reverse to post oldest first
-  for (const commit of commits.reverse()) {
-    const cacheKey = `github:${commit.sha}`;
-    const cached = await env.EAT_LASERS_GITHUB_POSTED_CACHE.get(cacheKey);
+  for (const { commit, cacheKey } of candidates) {
+    const result = await postToDiscord(env.EAT_LASERS_GITHUB_DISCORD_WEBHOOK_URL, commit, repo);
 
-    if (cached) {
-      skipped++;
-      continue;
-    }
-
-    const success = await postToDiscord(env.EAT_LASERS_GITHUB_DISCORD_WEBHOOK_URL, commit, repo);
-
-    if (success) {
+    if (result.success) {
       await env.EAT_LASERS_GITHUB_POSTED_CACHE.put(cacheKey, '1', {
         expirationTtl: ONE_MONTH_SECONDS,
       });
       posted++;
+      console.log(`Posted: [${repo}] ${commit.sha.slice(0, 7)}`);
+    } else if (result.fatal) {
+      // Only cache 4xx errors as poison pills
+      await env.EAT_LASERS_GITHUB_POSTED_CACHE.put(cacheKey, 'failed', {
+        expirationTtl: POISON_PILL_TTL_SECONDS,
+      });
+      failed++;
+      console.warn(`Failed (poison pill 24h): [${repo}] ${commit.sha.slice(0, 7)}`);
+    } else {
+      // Transient error - don't cache, will retry next run
+      failed++;
+      console.warn(`Failed (will retry): [${repo}] ${commit.sha.slice(0, 7)}`);
+    }
 
-      // Rate limit: wait 2 seconds between posts to avoid Discord rate limits
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+    // Short delay between posts
+    if (posted + failed < candidates.length) {
+      await new Promise((resolve) => setTimeout(resolve, DELAY_BETWEEN_POSTS_MS));
     }
   }
 
-  return { posted, skipped };
+  return { posted, skipped, failed };
 }
 
 export default {
@@ -176,15 +235,17 @@ export default {
 
     let totalPosted = 0;
     let totalSkipped = 0;
+    let totalFailed = 0;
 
     for (const repo of REPOS) {
-      const { posted, skipped } = await processRepo(repo, env);
+      const { posted, skipped, failed } = await processRepo(repo, env);
       totalPosted += posted;
       totalSkipped += skipped;
-      console.log(`${repo}: posted ${posted}, skipped ${skipped}`);
+      totalFailed += failed;
+      console.log(`${repo}: posted ${posted}, skipped ${skipped}, failed ${failed}`);
     }
 
-    console.log(`Done! Total posted: ${totalPosted}, skipped: ${totalSkipped}`);
+    console.log(`Done! Posted: ${totalPosted}, skipped: ${totalSkipped}, failed: ${totalFailed}`);
   },
 
   async fetch(

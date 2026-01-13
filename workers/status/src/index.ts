@@ -239,53 +239,64 @@ function createDiscordEmbed(entry: StatusEntry, config: FeedConfig) {
   return embed;
 }
 
-async function postToDiscord(webhookUrl: string, entry: StatusEntry, config: FeedConfig, retries = 3): Promise<boolean> {
+interface PostResult {
+  success: boolean;
+  fatal: boolean; // true = permanent failure (4xx), false = transient (5xx/network)
+}
+
+async function postToDiscord(webhookUrl: string, entry: StatusEntry, config: FeedConfig, retries = 3): Promise<PostResult> {
   const embed = createDiscordEmbed(entry, config);
 
   for (let attempt = 0; attempt < retries; attempt++) {
-    const response = await fetch(webhookUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        embeds: [embed],
-      }),
-    });
+    try {
+      const response = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          embeds: [embed],
+        }),
+      });
 
-    if (response.ok) {
-      return true;
-    }
+      if (response.ok) {
+        return { success: true, fatal: false };
+      }
 
-    // Handle rate limiting with retry
-    if (response.status === 429) {
-      const retryAfter = response.headers.get('Retry-After');
-      const parsedRetry = retryAfter ? parseInt(retryAfter) : NaN;
-      const waitMs = !isNaN(parsedRetry) ? parsedRetry * 1000 : (attempt + 1) * 1000;
-      console.log(`Rate limited, waiting ${waitMs}ms before retry...`);
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
-      continue;
-    }
+      // Handle rate limiting with retry
+      if (response.status === 429) {
+        const retryAfter = response.headers.get('Retry-After');
+        const parsedRetry = retryAfter ? parseInt(retryAfter) : NaN;
+        const waitMs = !isNaN(parsedRetry) ? parsedRetry * 1000 : (attempt + 1) * 1000;
+        console.log(`Rate limited, waiting ${waitMs}ms before retry...`);
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        continue;
+      }
 
-    // Don't retry 4xx client errors (except 429) - these won't succeed on retry
-    if (response.status >= 400 && response.status < 500) {
-      console.error(`Discord rejected entry (${response.status}): ${entry.title.slice(0, 50)}`);
-      return false;
-    }
+      // 4xx client errors (except 429) are fatal - won't succeed on retry
+      if (response.status >= 400 && response.status < 500) {
+        console.error(`Discord rejected entry (${response.status}): ${entry.title.slice(0, 50)}`);
+        return { success: false, fatal: true };
+      }
 
-    // Retry 5xx server errors
-    if (response.status >= 500) {
-      console.warn(`Discord server error (${response.status}), attempt ${attempt + 1}/${retries}`);
+      // Retry 5xx server errors
+      if (response.status >= 500) {
+        console.warn(`Discord server error (${response.status}), attempt ${attempt + 1}/${retries}`);
+        await new Promise((resolve) => setTimeout(resolve, (attempt + 1) * 1000));
+        continue;
+      }
+
+      console.error(`Failed to post to Discord: ${response.status}`);
+      return { success: false, fatal: false };
+    } catch (err) {
+      // Network errors (DNS, timeout, etc.) - retry
+      console.warn(`Network error posting to Discord (attempt ${attempt + 1}/${retries}):`, err);
       await new Promise((resolve) => setTimeout(resolve, (attempt + 1) * 1000));
-      continue;
     }
-
-    console.error(`Failed to post to Discord: ${response.status}`);
-    return false;
   }
 
   console.error('Failed to post to Discord after retries');
-  return false;
+  return { success: false, fatal: false }; // Transient - retry next run
 }
 
 interface EntryCandidate {
@@ -367,21 +378,25 @@ export default {
     let failed = 0;
 
     for (const { entry, config, cacheKey } of candidates) {
-      const success = await postToDiscord(env.EAT_LASERS_STATUS_DISCORD_WEBHOOK_URL, entry, config);
+      const result = await postToDiscord(env.EAT_LASERS_STATUS_DISCORD_WEBHOOK_URL, entry, config);
 
-      if (success) {
+      if (result.success) {
         await env.EAT_LASERS_STATUS_POSTED_CACHE.put(cacheKey, '1', {
           expirationTtl: ONE_MONTH_SECONDS,
         });
         posted++;
         console.log(`Posted: [${config.name}] ${entry.title.slice(0, 50)}...`);
-      } else {
-        // Cache failed entries with shorter TTL to allow retry if transient
+      } else if (result.fatal) {
+        // Only cache 4xx errors as poison pills
         await env.EAT_LASERS_STATUS_POSTED_CACHE.put(cacheKey, 'failed', {
           expirationTtl: POISON_PILL_TTL_SECONDS,
         });
         failed++;
-        console.warn(`Failed (cached 24h): [${config.name}] ${entry.title.slice(0, 50)}...`);
+        console.warn(`Failed (poison pill 24h): [${config.name}] ${entry.title.slice(0, 50)}...`);
+      } else {
+        // Transient error - don't cache, will retry next run
+        failed++;
+        console.warn(`Failed (will retry): [${config.name}] ${entry.title.slice(0, 50)}...`);
       }
 
       // Short delay between posts
