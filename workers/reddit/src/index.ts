@@ -59,7 +59,7 @@ interface RedditResponse {
 const ONE_MONTH_SECONDS = 30 * 24 * 60 * 60;
 
 async function fetchSubredditTop(subreddit: string): Promise<RedditPost[]> {
-  const url = `https://www.reddit.com/r/${subreddit}/top.json?t=day&limit=10`;
+  const url = `https://www.reddit.com/r/${subreddit}/top.json?t=week&limit=10`;
 
   const response = await fetch(url, {
     headers: {
