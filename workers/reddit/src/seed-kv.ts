@@ -31,6 +31,7 @@ const SUBREDDITS = [
   'PromptEngineering',
   'indiehackers',
   'nocode',
+  'google_antigravity',
 ];
 
 interface RedditPost {

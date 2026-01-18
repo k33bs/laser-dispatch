@@ -52,6 +52,32 @@ const FEEDS: FeedConfig[] = [
 const KV_BINDING = 'EAT_LASERS_STATUS_POSTED_CACHE';
 const ONE_MONTH_SECONDS = 30 * 24 * 60 * 60;
 
+// Decode HTML entities from status feed responses
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&mdash;/g, '—')
+    .replace(/&ndash;/g, '–')
+    .replace(/&copy;/g, '©')
+    .replace(/&hellip;/g, '…')
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, code) => String.fromCharCode(parseInt(code, 16)));
+}
+
+// Strip HTML tags and clean up whitespace
+function stripHtml(text: string): string {
+  return text
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function extractTextContent(xml: string, tag: string): string {
   const regex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i');
   const match = xml.match(regex);
@@ -59,7 +85,7 @@ function extractTextContent(xml: string, tag: string): string {
   let content = match[1];
   const cdataMatch = content.match(/<!\[CDATA\[([\s\S]*?)\]\]>/);
   if (cdataMatch) content = cdataMatch[1];
-  return content.replace(/<[^>]+>/g, '').trim();
+  return stripHtml(decodeHtmlEntities(content));
 }
 
 function parseAtomFeed(xml: string, provider: string): StatusEntry[] {

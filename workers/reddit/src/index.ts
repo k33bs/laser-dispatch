@@ -24,7 +24,8 @@ const SUBREDDITS = [
   "githubcopilot",
   "PromptEngineering",
   "indiehackers",
-  "nocode"
+  "nocode",
+  "google_antigravity"
 ];
 
 interface RedditPost {
